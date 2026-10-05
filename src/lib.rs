@@ -69,6 +69,9 @@ impl slang_ui::Hook for App {
 fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
     match &cmd.kind {
         CmdKind::Assert { condition, message } => Ok(IVLCmd::assert(condition, message)),
+        CmdKind::Assume { condition } => Ok(IVLCmd::assume(condition)),
+        CmdKind::Assignment { name, expr } => Ok(IVLCmd::assign(name, expr)),
+        CmdKind::Seq(c1, c2) => Ok(IVLCmd::seq(&cmd_to_ivlcmd(c1)?, &cmd_to_ivlcmd(c2)?)),
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
     }
 }
@@ -77,7 +80,22 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
 fn wp(ivl: &IVLCmd, post: &Expr) -> Result<(Expr, Span, String)> {
     match &ivl.kind {
         IVLCmdKind::Assert { condition, message } => {
-            Ok((condition.clone(), condition.span, message.clone()))
+            Ok((condition.clone().and(post), condition.span, message.clone()))
+        }
+        IVLCmdKind::Assume { condition } => {
+            Ok((condition.clone().imp(post), ivl.span, String::new()))
+        }
+        IVLCmdKind::Assignment { name, expr } => {
+            Ok((post.subst_ident(&name.ident, expr), ivl.span, String::new()))
+        }
+        IVLCmdKind::Seq(c1, c2) => {
+            let (q, s2, m2) = wp(c2, post)?;
+            let (p, s1, m1) = wp(c1, &q)?;
+            if m1.is_empty() {
+                Ok((p, s2, m2))
+            } else {
+                Ok((p, s1, m1))
+            }
         }
         c => bail!("not yet implemented: wp of {:?}", c),
     }
