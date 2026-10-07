@@ -72,6 +72,33 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
         CmdKind::Assume { condition } => Ok(IVLCmd::assume(condition)),
         CmdKind::Assignment { name, expr } => Ok(IVLCmd::assign(name, expr)),
         CmdKind::Seq(c1, c2) => Ok(IVLCmd::seq(&cmd_to_ivlcmd(c1)?, &cmd_to_ivlcmd(c2)?)),
+        CmdKind::VarDefinition { name, ty, expr, .. } => match expr {
+            Some(e) => Ok(IVLCmd::assign(name, e)),
+            None => Ok(IVLCmd::havoc(name, ty)),
+        },
+        CmdKind::Match { body } => {
+            let branches: Vec<IVLCmd> = body
+                .cases
+                .iter()
+                .map(|case| {
+                    Ok(IVLCmd::seq(
+                        &IVLCmd::assume(&case.condition),
+                        &cmd_to_ivlcmd(&case.cmd)?,
+                    ))
+                })
+                .collect::<Result<_>>()?;
+
+            let any = body
+                .cases
+                .iter()
+                .map(|case| case.condition.clone())
+                .reduce(|a, b| a.or(&b))
+                .unwrap_or(Expr::bool(false));
+
+            let assertion = IVLCmd::assert(&any, "no match case applies");
+
+            Ok(assertion.seq(&IVLCmd::nondets(&branches)))
+        }
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
     }
 }
@@ -88,6 +115,14 @@ fn wp(ivl: &IVLCmd, post: &Expr) -> Result<(Expr, Span, String)> {
         IVLCmdKind::Assignment { name, expr } => {
             Ok((post.subst_ident(&name.ident, expr), ivl.span, String::new()))
         }
+        IVLCmdKind::Havoc { name, ty } => {
+            let fresh = Expr::ident(&format!("{}'", name), ty);
+            Ok((
+                post.subst_ident(&name.ident, &fresh),
+                ivl.span,
+                String::new(),
+            ))
+        }
         IVLCmdKind::Seq(c1, c2) => {
             let (q, s2, m2) = wp(c2, post)?;
             let (p, s1, m1) = wp(c1, &q)?;
@@ -97,6 +132,15 @@ fn wp(ivl: &IVLCmd, post: &Expr) -> Result<(Expr, Span, String)> {
                 Ok((p, s1, m1))
             }
         }
-        c => bail!("not yet implemented: wp of {:?}", c),
+        IVLCmdKind::NonDet(c1, c2) => {
+            let (p, s1, m1) = wp(c1, post)?;
+            let (q, s2, m2) = wp(c2, post)?;
+            if m1.is_empty() {
+                Ok((p.and(&q), s2, m2))
+            } else {
+                Ok((p.and(&q), s1, m1))
+            }
+        }
+        //c => bail!("not yet implemented: wp of {:?}", c),
     }
 }
