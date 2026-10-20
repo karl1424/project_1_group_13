@@ -3,7 +3,10 @@ mod ivl_ext;
 
 use ivl::{IVLCmd, IVLCmdKind};
 use slang::ast::{Cmd, CmdKind, Expr};
-use slang_ui::prelude::{slang::Span, *};
+use slang_ui::prelude::{
+    slang::{ast::Name, Span},
+    *,
+};
 
 pub struct App;
 
@@ -36,9 +39,15 @@ impl slang_ui::Hook for App {
                 .map(|pre| Ok(pre.smt(cx.smt_st())?.as_bool()?))
                 .collect::<Result<_>>()?;
 
+            let ensures: Vec<IVLCmd> = m
+                .ensures()
+                .map(|p| IVLCmd::assert(p, "postcondition might not hold"))
+                .collect();
+
             // get method body, convert to IVL
             let cmd = &m.body.clone().unwrap().cmd;
-            let ivl = cmd_to_ivlcmd(cmd)?;
+            let body = cmd_to_ivlcmd(cmd)?;
+            let ivl = body.seq(&IVLCmd::seqs(&ensures));
 
             let mut n = 0;
 
@@ -117,6 +126,13 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
 
             Ok(assertion.seq(&IVLCmd::nondets(&branches)))
         }
+        CmdKind::Return { expr } => {
+            if let Some(expr) = expr {
+                return Ok(IVLCmd::assign(&Name::ident("result".to_string()), expr))
+            }
+            Ok(IVLCmd::nop())
+        }
+
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
     }
 }
@@ -127,7 +143,8 @@ fn swp(ivl: &IVLCmd, post: &Vec<Obligation>, n: &mut usize) -> Result<Vec<Obliga
         IVLCmdKind::Assert { condition, message } => {
             let mut out: Vec<Obligation> = post
                 .into_iter()
-                .map(|o| o.clone().transform(|e| condition.clone().imp(e))).collect();
+                .map(|o| o.clone().transform(|e| condition.clone().imp(e)))
+                .collect();
             out.push(Obligation {
                 condition: condition.clone(),
                 span: condition.span,
