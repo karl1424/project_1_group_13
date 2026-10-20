@@ -41,7 +41,13 @@ impl slang_ui::Hook for App {
 
             let ensures: Vec<IVLCmd> = m
                 .ensures()
-                .map(|p| IVLCmd::assert(p, "postcondition might not hold"))
+                .map(|p| {
+                    let p = match &m.return_ty {
+                        Some(ty) => p.subst_result(&Expr::ident(&"result".to_string(), ty)),
+                        None => p.clone(),
+                    };
+                    IVLCmd::assert(&p, "postcondition might not hold")
+                })
                 .collect();
 
             // get method body, convert to IVL
@@ -128,7 +134,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
         }
         CmdKind::Return { expr } => {
             if let Some(expr) = expr {
-                return Ok(IVLCmd::assign(&Name::ident("result".to_string()), expr))
+                return Ok(IVLCmd::assign(&Name::ident("result".to_string()), expr));
             }
             Ok(IVLCmd::nop())
         }
