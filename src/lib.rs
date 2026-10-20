@@ -42,11 +42,11 @@ impl slang_ui::Hook for App {
             let ensures: Vec<IVLCmd> = m
                 .ensures()
                 .map(|p| {
-                    let p = match &m.return_ty {
+                    let q = match &m.return_ty {
                         Some(ty) => p.subst_result(&Expr::ident(&"result".to_string(), ty)),
                         None => p.clone(),
                     };
-                    IVLCmd::assert(&p, "postcondition might not hold")
+                    IVLCmd::assert(&q.with_span(p.span), "postcondition might not hold")
                 })
                 .collect();
 
