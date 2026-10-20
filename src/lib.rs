@@ -7,6 +7,22 @@ use slang_ui::prelude::{slang::Span, *};
 
 pub struct App;
 
+#[derive(Debug, Clone)]
+struct Obligation {
+    condition: Expr,
+    span: Span,
+    message: String,
+}
+
+impl Obligation {
+    fn transform(self, f: impl Fn(&Expr) -> Expr) -> Obligation {
+        Obligation {
+            condition: f(&self.condition),
+            ..self
+        }
+    }
+}
+
 impl slang_ui::Hook for App {
     fn analyze(&self, cx: &slang_ui::Context, file: &slang::SourceFile) -> Result<()> {
         // get reference to z3 solver
@@ -24,11 +40,13 @@ impl slang_ui::Hook for App {
             let cmd = &m.body.clone().unwrap().cmd;
             let ivl = cmd_to_ivlcmd(cmd)?;
 
-            // compute single proof obligation using postcondition true
-            let (oblig, oblig_span, msg) = wp(&ivl, &Expr::bool(true))?;
+            let mut n = 0;
 
             // put all obligations into a list of oblications with span for error localication
-            let obligations = vec![(oblig.smt(cx.smt_st())?.as_bool()?, oblig_span, msg)];
+            let obligations: Vec<_> = swp(&ivl, &vec![], &mut n)?
+                .into_iter()
+                .map(|o| Ok((o.condition.smt(cx.smt_st())?.as_bool()?, o.span, o.message)))
+                .collect::<Result<_>>()?;
 
             // open a solver scope for this method
             solver.scope(|solver| {
@@ -103,44 +121,44 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
     }
 }
 
-/// Compute the weakest precondition of IVL program
-fn wp(ivl: &IVLCmd, post: &Expr) -> Result<(Expr, Span, String)> {
+/// Compute the weakest precondition set of IVL program
+fn swp(ivl: &IVLCmd, post: &Vec<Obligation>, n: &mut usize) -> Result<Vec<Obligation>> {
     match &ivl.kind {
         IVLCmdKind::Assert { condition, message } => {
-            Ok((condition.clone().and(post), condition.span, message.clone()))
+            let mut out: Vec<Obligation> = post
+                .into_iter()
+                .map(|o| o.clone().transform(|e| condition.clone().imp(e))).collect();
+            out.push(Obligation {
+                condition: condition.clone(),
+                span: condition.span,
+                message: message.clone(),
+            });
+            Ok(out)
         }
-        IVLCmdKind::Assume { condition } => {
-            Ok((condition.clone().imp(post), ivl.span, String::new()))
-        }
-        IVLCmdKind::Assignment { name, expr } => {
-            Ok((post.subst_ident(&name.ident, expr), ivl.span, String::new()))
-        }
+        IVLCmdKind::Assume { condition } => Ok(post
+            .into_iter()
+            .map(|o| o.clone().transform(|e| condition.clone().imp(e)))
+            .collect()),
+        IVLCmdKind::Assignment { name, expr } => Ok(post
+            .into_iter()
+            .map(|o| o.clone().transform(|e| e.subst_ident(&name.ident, expr)))
+            .collect()),
         IVLCmdKind::Havoc { name, ty } => {
-            let fresh = Expr::ident(&format!("{}'", name), ty);
-            Ok((
-                post.subst_ident(&name.ident, &fresh),
-                ivl.span,
-                String::new(),
-            ))
+            let fresh = Expr::ident(&format!("{}#{}", name, *n), ty);
+            *n += 1;
+            Ok(post
+                .into_iter()
+                .map(|o| o.clone().transform(|e| e.subst_ident(&name.ident, &fresh)))
+                .collect())
         }
         IVLCmdKind::Seq(c1, c2) => {
-            let (q, s2, m2) = wp(c2, post)?;
-            let (p, s1, m1) = wp(c1, &q)?;
-            if m1.is_empty() {
-                Ok((p, s2, m2))
-            } else {
-                Ok((p, s1, m1))
-            }
+            let q = swp(c2, post, n)?;
+            swp(c1, &q, n)
         }
         IVLCmdKind::NonDet(c1, c2) => {
-            let (p, s1, m1) = wp(c1, post)?;
-            let (q, s2, m2) = wp(c2, post)?;
-            if m1.is_empty() {
-                Ok((p.and(&q), s2, m2))
-            } else {
-                Ok((p.and(&q), s1, m1))
-            }
-        }
-        //c => bail!("not yet implemented: wp of {:?}", c),
+            let mut q = swp(c1, &post.clone(), n)?;
+            q.extend(swp(c2, post, n)?);
+            Ok(q)
+        } //c => bail!("not yet implemented: wp of {:?}", c),
     }
 }
