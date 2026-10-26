@@ -4,7 +4,10 @@ mod ivl_ext;
 use ivl::{IVLCmd, IVLCmdKind};
 use slang::ast::{Cmd, CmdKind, Expr};
 use slang_ui::prelude::{
-    slang::{ast::Name, Span},
+    slang::{
+        ast::{Name, PrefixOp, Type},
+        Span,
+    },
     *,
 };
 
@@ -46,7 +49,7 @@ impl slang_ui::Hook for App {
                         Some(ty) => p.subst_result(&Expr::ident(&"result".to_string(), ty)),
                         None => p.clone(),
                     };
-                    IVLCmd::assert(&q.with_span(p.span), "postcondition might not hold")
+                    IVLCmd::assert(&q.with_span(p.span), "Postcondition might not hold")
                 })
                 .collect();
 
@@ -128,7 +131,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 .reduce(|a, b| a.or(&b))
                 .unwrap_or(Expr::bool(false));
 
-            let assertion = IVLCmd::assert(&any, "no match case applies");
+            let assertion = IVLCmd::assert(&any, "No match case applies");
 
             Ok(assertion.seq(&IVLCmd::nondets(&branches)))
         }
@@ -138,7 +141,61 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
             }
             Ok(IVLCmd::nop())
         }
+        CmdKind::Loop {
+            invariants,
+            variant: _,
+            body,
+        } => {
+            let assert_inv = IVLCmd::seqs(
+                &invariants
+                    .iter()
+                    .map(|i| IVLCmd::assert(i, "Loop invariant might not hold on entry"))
+                    .collect::<Vec<_>>(),
+            );
 
+            let havoc_cmd = IVLCmd::seqs(
+                &body
+                    .cases
+                    .iter()
+                    .flat_map(|case| collect_assigned_vars(&case.cmd))
+                    .map(|(name, ty)| IVLCmd::havoc(&name, &ty))
+                    .collect::<Vec<_>>(),
+            );
+
+            let assume_inv =
+                IVLCmd::seqs(&invariants.iter().map(IVLCmd::assume).collect::<Vec<_>>());
+
+            let branches: Vec<IVLCmd> = body
+                .cases
+                .iter()
+                .map(|case| Ok(IVLCmd::assume(&case.condition).seq(&cmd_to_ivlcmd(&case.cmd)?)))
+                .collect::<Result<_>>()?;
+
+            let loop_body = IVLCmd::nondets(&branches);
+
+            let body_branch = loop_body
+                .seq(&IVLCmd::seqs(
+                    &invariants
+                        .iter()
+                        .map(|i| IVLCmd::assert(i, "Loop invariant might not be preserved"))
+                        .collect::<Vec<_>>(),
+                ))
+                .seq(&IVLCmd::assume(&Expr::bool(false)));
+
+            let b = body
+                .cases
+                .iter()
+                .map(|c| c.condition.clone())
+                .reduce(|a, b| a.or(&b))
+                .unwrap_or(Expr::bool(false));
+
+            let exit_branch = IVLCmd::assume(&b.prefix(PrefixOp::Not));
+
+            Ok(assert_inv
+                .seq(&havoc_cmd)
+                .seq(&assume_inv)
+                .seq(&body_branch.nondet(&exit_branch)))
+        }
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
     }
 }
@@ -167,7 +224,7 @@ fn swp(ivl: &IVLCmd, post: &Vec<Obligation>, n: &mut usize) -> Result<Vec<Obliga
             .map(|o| o.clone().transform(|e| e.subst_ident(&name.ident, expr)))
             .collect()),
         IVLCmdKind::Havoc { name, ty } => {
-            let fresh = Expr::ident(&format!("{}#{}", name, *n), ty);
+            let fresh = Expr::ident(&format!("{}_havoc_{}", name, *n), ty);
             *n += 1;
             Ok(post
                 .into_iter()
@@ -183,5 +240,32 @@ fn swp(ivl: &IVLCmd, post: &Vec<Obligation>, n: &mut usize) -> Result<Vec<Obliga
             q.extend(swp(c2, post, n)?);
             Ok(q)
         } //c => bail!("not yet implemented: wp of {:?}", c),
+    }
+}
+
+fn collect_assigned_vars(cmd: &Cmd) -> Vec<(Name, Type)> {
+    match &cmd.kind {
+        CmdKind::Assignment { name, expr } => {
+            vec![(name.clone(), expr.ty.clone())]
+        }
+        CmdKind::VarDefinition {
+            name,
+            ty,
+            expr: Some(_),
+            ..
+        } => {
+            vec![(name.clone(), ty.clone())]
+        }
+        CmdKind::Seq(c1, c2) => {
+            let mut v = collect_assigned_vars(c1);
+            v.extend(collect_assigned_vars(c2));
+            v
+        }
+        CmdKind::Match { body } | CmdKind::Loop { body, .. } => body
+            .cases
+            .iter()
+            .flat_map(|c| collect_assigned_vars(&c.cmd))
+            .collect(),
+        _ => vec![],
     }
 }
