@@ -2,7 +2,7 @@ pub mod ivl;
 mod ivl_ext;
 
 use ivl::{IVLCmd, IVLCmdKind};
-use slang::ast::{Cmd, CmdKind, Expr};
+use slang::ast::{Cmd, CmdKind, Expr, ExprKind, Op};
 use slang_ui::prelude::{
     slang::{
         ast::{Name, PrefixOp, Type},
@@ -104,12 +104,14 @@ impl slang_ui::Hook for App {
 /// Encode a Cmd into IVL
 fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
     match &cmd.kind {
-        CmdKind::Assert { condition, message } => Ok(IVLCmd::assert(condition, message)),
-        CmdKind::Assume { condition } => Ok(IVLCmd::assume(condition)),
-        CmdKind::Assignment { name, expr } => Ok(IVLCmd::assign(name, expr)),
+        CmdKind::Assert { condition, message } => {
+            Ok(guarded(condition, IVLCmd::assert(condition, message)))
+        }
+        CmdKind::Assume { condition } => Ok(guarded(condition, IVLCmd::assume(condition))),
+        CmdKind::Assignment { name, expr } => Ok(guarded(expr, IVLCmd::assign(name, expr))),
         CmdKind::Seq(c1, c2) => Ok(IVLCmd::seq(&cmd_to_ivlcmd(c1)?, &cmd_to_ivlcmd(c2)?)),
         CmdKind::VarDefinition { name, ty, expr, .. } => match expr {
-            Some(e) => Ok(IVLCmd::assign(name, e)),
+            Some(e) => Ok(guarded(e, IVLCmd::assign(name, e))),
             None => Ok(IVLCmd::havoc(name, ty)),
         },
         CmdKind::Match { body } => {
@@ -131,9 +133,17 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 .reduce(|a, b| a.or(&b))
                 .unwrap_or(Expr::bool(false));
 
+            let checks: Vec<IVLCmd> = body
+                .cases
+                .iter()
+                .flat_map(|c| div_checks(&c.condition))
+                .collect();
+
             let assertion = IVLCmd::assert(&any, "No match case applies");
 
-            Ok(assertion.seq(&IVLCmd::nondets(&branches)))
+            Ok(IVLCmd::seqs(&checks)
+                .seq(&assertion)
+                .seq(&IVLCmd::nondets(&branches)))
         }
         CmdKind::Return { expr } => {
             if let Some(expr) = expr {
@@ -149,7 +159,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
             let assert_inv = IVLCmd::seqs(
                 &invariants
                     .iter()
-                    .map(|i| IVLCmd::assert(i, "Loop invariant might not hold on entry"))
+                    .map(|i| guarded(i, IVLCmd::assert(i, "Loop invariant might not hold on entry")))
                     .collect::<Vec<_>>(),
             );
 
@@ -171,13 +181,15 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 .map(|case| Ok(IVLCmd::assume(&case.condition).seq(&cmd_to_ivlcmd(&case.cmd)?)))
                 .collect::<Result<_>>()?;
 
+            let guard_checks = IVLCmd::seqs(&body.cases.iter().flat_map(|c| div_checks(&c.condition)).collect::<Vec<_>>());
+
             let loop_body = IVLCmd::nondets(&branches);
 
             let body_branch = loop_body
                 .seq(&IVLCmd::seqs(
                     &invariants
                         .iter()
-                        .map(|i| IVLCmd::assert(i, "Loop invariant might not be preserved"))
+                        .map(|i| guarded(i, IVLCmd::assert(i, "Loop invariant might not be preserved")))
                         .collect::<Vec<_>>(),
                 ))
                 .seq(&IVLCmd::assume(&Expr::bool(false)));
@@ -194,6 +206,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
             Ok(assert_inv
                 .seq(&havoc_cmd)
                 .seq(&assume_inv)
+                .seq(&guard_checks)
                 .seq(&body_branch.nondet(&exit_branch)))
         }
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
@@ -268,4 +281,23 @@ fn collect_assigned_vars(cmd: &Cmd) -> Vec<(Name, Type)> {
             .collect(),
         _ => vec![],
     }
+}
+
+fn div_checks(e: &Expr) -> Vec<IVLCmd> {
+    let mut out = vec![];
+    let _ = e.pre_order_map(|x| {
+        if let ExprKind::Infix(_, Op::Div | Op::Mod, d) = &x.kind {
+            let cond = Expr::ne(d, &Expr::num(0)).with_span(x.span);
+            out.push(IVLCmd::assert(&cond, "Possible division by zero"));
+        }
+        None
+    });
+    out.reverse();
+    out
+}
+
+fn guarded(e: &Expr, cmd: IVLCmd) -> IVLCmd {
+    let mut cmds = div_checks(e);
+    cmds.push(cmd);
+    IVLCmd::seqs(&cmds)
 }
