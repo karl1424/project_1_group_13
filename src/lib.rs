@@ -2,10 +2,10 @@ pub mod ivl;
 mod ivl_ext;
 
 use ivl::{IVLCmd, IVLCmdKind};
-use slang::ast::{Cmd, CmdKind, Expr, ExprKind, Op};
+use slang::ast::{Cmd, CmdKind, Expr, ExprKind, Op, Range};
 use slang_ui::prelude::{
     slang::{
-        ast::{Name, PrefixOp, Type},
+        ast::{Case, Name, PrefixOp, Type},
         Span,
     },
     *,
@@ -159,7 +159,12 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
             let assert_inv = IVLCmd::seqs(
                 &invariants
                     .iter()
-                    .map(|i| guarded(i, IVLCmd::assert(i, "Loop invariant might not hold on entry")))
+                    .map(|i| {
+                        guarded(
+                            i,
+                            IVLCmd::assert(i, "Loop invariant might not hold on entry"),
+                        )
+                    })
                     .collect::<Vec<_>>(),
             );
 
@@ -181,7 +186,13 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 .map(|case| Ok(IVLCmd::assume(&case.condition).seq(&cmd_to_ivlcmd(&case.cmd)?)))
                 .collect::<Result<_>>()?;
 
-            let guard_checks = IVLCmd::seqs(&body.cases.iter().flat_map(|c| div_checks(&c.condition)).collect::<Vec<_>>());
+            let guard_checks = IVLCmd::seqs(
+                &body
+                    .cases
+                    .iter()
+                    .flat_map(|c| div_checks(&c.condition))
+                    .collect::<Vec<_>>(),
+            );
 
             let loop_body = IVLCmd::nondets(&branches);
 
@@ -189,7 +200,12 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 .seq(&IVLCmd::seqs(
                     &invariants
                         .iter()
-                        .map(|i| guarded(i, IVLCmd::assert(i, "Loop invariant might not be preserved")))
+                        .map(|i| {
+                            guarded(
+                                i,
+                                IVLCmd::assert(i, "Loop invariant might not be preserved"),
+                            )
+                        })
                         .collect::<Vec<_>>(),
                 ))
                 .seq(&IVLCmd::assume(&Expr::bool(false)));
@@ -208,6 +224,26 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 .seq(&assume_inv)
                 .seq(&guard_checks)
                 .seq(&body_branch.nondet(&exit_branch)))
+        }
+        CmdKind::For {
+            name,
+            range,
+            invariants,
+            variant,
+            body,
+        } => {
+            let Range::FromTo(from, to) = range;
+            let init = guarded(from, IVLCmd::assign(name, from));
+            let increment = Cmd::assign(
+                name,
+                &Expr::ident(&name.ident, &Type::Int).add(&Expr::num(1)),
+            );
+            let case = Case {
+                condition: Expr::ident(&name.ident, &Type::Int).lt(&to),
+                cmd: Cmd::seq(&body.cmd, &increment),
+            };
+            let loop_cmd = Cmd::_loop(invariants, variant.clone(), &[case]);
+            Ok(init.seq(&cmd_to_ivlcmd(&loop_cmd)?))
         }
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
     }
