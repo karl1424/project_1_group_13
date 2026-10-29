@@ -233,6 +233,21 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
             body,
         } => {
             let Range::FromTo(from, to) = range;
+            const MAX_UNROLL: i64 = 64;
+            if invariants.is_empty() {
+                if let (ExprKind::Num(a), ExprKind::Num(b)) = (&from.kind, &to.kind) {
+                    if *b - *a <= MAX_UNROLL {
+                        let mut cmds = vec![];
+                        for k in *a..*b {
+                            cmds.push(IVLCmd::assign(name, &Expr::num(k)));
+                            cmds.push(cmd_to_ivlcmd(&body.cmd)?);
+                        }
+                        let last = if *a <= *b { *b } else { *a };
+                        cmds.push(IVLCmd::assign(name, &Expr::num(last)));
+                        return Ok(IVLCmd::seqs(&cmds));
+                    }
+                }
+            }
             let init = guarded(from, IVLCmd::assign(name, from));
             let increment = Cmd::assign(
                 name,
