@@ -109,7 +109,13 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
         }
         CmdKind::Assume { condition } => Ok(guarded(condition, IVLCmd::assume(condition))),
         CmdKind::Assignment { name, expr } => Ok(guarded(expr, IVLCmd::assign(name, expr))),
-        CmdKind::Seq(c1, c2) => Ok(IVLCmd::seq(&cmd_to_ivlcmd(c1)?, &cmd_to_ivlcmd(c2)?)),
+        CmdKind::Seq(c1, c2) => {
+            if let CmdKind::Return { .. } = c1.kind {
+                Ok(cmd_to_ivlcmd(c1)?)
+            } else {
+                Ok(IVLCmd::seq(&cmd_to_ivlcmd(c1)?, &cmd_to_ivlcmd(c2)?))
+            }
+        }
         CmdKind::VarDefinition { name, ty, expr, .. } => match expr {
             Some(e) => Ok(guarded(e, IVLCmd::assign(name, e))),
             None => Ok(IVLCmd::havoc(name, ty)),
@@ -146,10 +152,11 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 .seq(&IVLCmd::nondets(&branches)))
         }
         CmdKind::Return { expr } => {
-            if let Some(expr) = expr {
-                return Ok(IVLCmd::assign(&Name::ident("result".to_string()), expr));
+            if let Some(e) = expr {
+                Ok(IVLCmd::assign(&Name::ident("result".to_string()), e))
+            } else {
+                Ok(IVLCmd::nop())
             }
-            Ok(IVLCmd::nop())
         }
         CmdKind::Loop {
             invariants,
