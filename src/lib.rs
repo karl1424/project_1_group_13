@@ -67,10 +67,8 @@ impl slang_ui::Hook for App {
             let body = cmd_to_ivlcmd(cmd, &ensures_ivl)?;
             let ivl = body.seq(&ensures_ivl);
 
-            let mut n = 0;
-
             // put all obligations into a list of oblications with span for error localication
-            let obligations: Vec<_> = swp(&ivl, &vec![], &mut n)?
+            let obligations: Vec<_> = swp(&ivl, &vec![])?
                 .into_iter()
                 .map(|o| Ok((o.condition.smt(cx.smt_st())?.as_bool()?, o.span, o.message)))
                 .collect::<Result<_>>()?;
@@ -290,55 +288,63 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
                 bail!("Unresolved method call");
             };
 
-            let mut cmds: Vec<IVLCmd> = vec![];
             let mut subst: Vec<(String, Expr)> = vec![];
 
-            for (x, e) in m.args.iter().zip(args) {
-                let p_name = Name {
-                    span: e.span,
-                    ident: fresh(&x.name.ident),
-                };
-                cmds.push(IVLCmd::havoc(&p_name, &x.ty));
-                cmds.push(guarded(e, IVLCmd::assign(&p_name, e)));
-                subst.push((x.name.ident.clone(), Expr::ident(&p_name.ident, &x.ty)));
-            }
-
-            for f in m.requires() {
-                let pre = subst
+            let assign = IVLCmd::seqs(
+                &m.args
                     .iter()
-                    .fold(f.clone(), |e, (x, p)| e.subst_ident(x, p));
-                cmds.push(IVLCmd::assert(
-                    &pre.with_span(cmd.span),
-                    "Precondition might not hold",
-                ));
-            }
+                    .zip(args)
+                    .map(|(x, e)| {
+                        let p_name = Name {
+                            span: e.span,
+                            ident: fresh(&x.name.ident),
+                        };
+                        subst.push((x.name.ident.clone(), Expr::ident(&p_name.ident, &x.ty)));
+                        guarded(e, IVLCmd::assign(&p_name, e))
+                    })
+                    .collect::<Vec<_>>(),
+            );
 
-            let z = match (name, &m.return_ty) {
-                (Some(z), Some(ty)) => {
-                    cmds.push(IVLCmd::havoc(z, ty));
-                    Some(Expr::ident(&z.ident, ty))
-                }
-                _ => None,
+            let pre = IVLCmd::seqs(
+                &m.requires()
+                    .into_iter()
+                    .map(|f| {
+                        let f_sub = subst
+                            .iter()
+                            .fold(f.clone(), |e, (x, p)| e.subst_ident(x, p));
+                        IVLCmd::assert(&f_sub.with_span(cmd.span), "Precondition might not hold")
+                    })
+                    .collect::<Vec<_>>(),
+            );
+
+            let (havoc, z) = match (name, &m.return_ty) {
+                (Some(z), Some(ty)) => (IVLCmd::havoc(z, ty), Some(Expr::ident(&z.ident, ty))),
+                _ => (IVLCmd::nop(), None),
             };
 
-            for g in m.ensures() {
-                let mut post = subst
-                    .iter()
-                    .fold(g.clone(), |e, (x, p)| e.subst_ident(x, p));
-                if let Some(z) = &z {
-                    post = post.subst_result(z);
-                }
-                cmds.push(IVLCmd::assume(&post));
-            }
+            let post = IVLCmd::seqs(
+                &m.ensures()
+                    .into_iter()
+                    .map(|g| {
+                        let mut g_sub = subst
+                            .iter()
+                            .fold(g.clone(), |e, (x, p)| e.subst_ident(x, p));
+                        if let Some(z) = &z {
+                            g_sub = g_sub.subst_result(z);
+                        }
+                        IVLCmd::assume(&g_sub.with_span(cmd.span))
+                    })
+                    .collect::<Vec<_>>(),
+            );
 
-            Ok(IVLCmd::seqs(&cmds))
+            Ok(assign.seq(&pre.seq(&havoc.seq(&post))))
         }
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
     }
 }
 
 /// Compute the weakest precondition set of IVL program
-fn swp(ivl: &IVLCmd, post: &Vec<Obligation>, n: &mut usize) -> Result<Vec<Obligation>> {
+fn swp(ivl: &IVLCmd, post: &Vec<Obligation>) -> Result<Vec<Obligation>> {
     match &ivl.kind {
         IVLCmdKind::Assert { condition, message } => {
             let mut out: Vec<Obligation> = post
@@ -361,20 +367,19 @@ fn swp(ivl: &IVLCmd, post: &Vec<Obligation>, n: &mut usize) -> Result<Vec<Obliga
             .map(|o| o.clone().transform(|e| e.subst_ident(&name.ident, expr)))
             .collect()),
         IVLCmdKind::Havoc { name, ty } => {
-            let fresh = Expr::ident(&format!("{}_havoc_{}", name, *n), ty);
-            *n += 1;
+            let fresh = Expr::ident(&fresh(&name.ident), ty);
             Ok(post
                 .into_iter()
                 .map(|o| o.clone().transform(|e| e.subst_ident(&name.ident, &fresh)))
                 .collect())
         }
         IVLCmdKind::Seq(c1, c2) => {
-            let q = swp(c2, post, n)?;
-            swp(c1, &q, n)
+            let q = swp(c2, post)?;
+            swp(c1, &q)
         }
         IVLCmdKind::NonDet(c1, c2) => {
-            let mut q = swp(c1, &post.clone(), n)?;
-            q.extend(swp(c2, post, n)?);
+            let mut q = swp(c1, &post.clone())?;
+            q.extend(swp(c2, post)?);
             Ok(q)
         } //c => bail!("not yet implemented: wp of {:?}", c),
     }
