@@ -53,10 +53,12 @@ impl slang_ui::Hook for App {
                 })
                 .collect();
 
+            let ensures_ivl = IVLCmd::seqs(&ensures);
+
             // get method body, convert to IVL
             let cmd = &m.body.clone().unwrap().cmd;
-            let body = cmd_to_ivlcmd(cmd)?;
-            let ivl = body.seq(&IVLCmd::seqs(&ensures));
+            let body = cmd_to_ivlcmd(cmd, &ensures_ivl)?;
+            let ivl = body.seq(&ensures_ivl);
 
             let mut n = 0;
 
@@ -102,20 +104,17 @@ impl slang_ui::Hook for App {
 }
 
 /// Encode a Cmd into IVL
-fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
+fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
     match &cmd.kind {
         CmdKind::Assert { condition, message } => {
             Ok(guarded(condition, IVLCmd::assert(condition, message)))
         }
         CmdKind::Assume { condition } => Ok(guarded(condition, IVLCmd::assume(condition))),
         CmdKind::Assignment { name, expr } => Ok(guarded(expr, IVLCmd::assign(name, expr))),
-        CmdKind::Seq(c1, c2) => {
-            if let CmdKind::Return { .. } = c1.kind {
-                Ok(cmd_to_ivlcmd(c1)?)
-            } else {
-                Ok(IVLCmd::seq(&cmd_to_ivlcmd(c1)?, &cmd_to_ivlcmd(c2)?))
-            }
-        }
+        CmdKind::Seq(c1, c2) => Ok(IVLCmd::seq(
+            &cmd_to_ivlcmd(c1, post)?,
+            &cmd_to_ivlcmd(c2, post)?,
+        )),
         CmdKind::VarDefinition { name, ty, expr, .. } => match expr {
             Some(e) => Ok(guarded(e, IVLCmd::assign(name, e))),
             None => Ok(IVLCmd::havoc(name, ty)),
@@ -127,7 +126,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 .map(|case| {
                     Ok(IVLCmd::seq(
                         &IVLCmd::assume(&case.condition),
-                        &cmd_to_ivlcmd(&case.cmd)?,
+                        &cmd_to_ivlcmd(&case.cmd, post)?,
                     ))
                 })
                 .collect::<Result<_>>()?;
@@ -152,11 +151,16 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 .seq(&IVLCmd::nondets(&branches)))
         }
         CmdKind::Return { expr } => {
+            let mut cmds = vec![];
             if let Some(e) = expr {
-                Ok(IVLCmd::assign(&Name::ident("result".to_string()), e))
-            } else {
-                Ok(IVLCmd::nop())
+                cmds.push(guarded(
+                    e,
+                    IVLCmd::assign(&Name::ident("result".to_string()), e),
+                ));
             }
+            cmds.push(post.clone());
+            cmds.push(IVLCmd::unreachable());
+            Ok(IVLCmd::seqs(&cmds))
         }
         CmdKind::Loop {
             invariants,
@@ -190,7 +194,9 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
             let branches: Vec<IVLCmd> = body
                 .cases
                 .iter()
-                .map(|case| Ok(IVLCmd::assume(&case.condition).seq(&cmd_to_ivlcmd(&case.cmd)?)))
+                .map(|case| {
+                    Ok(IVLCmd::assume(&case.condition).seq(&cmd_to_ivlcmd(&case.cmd, post)?))
+                })
                 .collect::<Result<_>>()?;
 
             let guard_checks = IVLCmd::seqs(
@@ -247,7 +253,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                         let mut cmds = vec![];
                         for k in *a..*b {
                             cmds.push(IVLCmd::assign(name, &Expr::num(k)));
-                            cmds.push(cmd_to_ivlcmd(&body.cmd)?);
+                            cmds.push(cmd_to_ivlcmd(&body.cmd, post)?);
                         }
                         let last = if *a <= *b { *b } else { *a };
                         cmds.push(IVLCmd::assign(name, &Expr::num(last)));
@@ -265,7 +271,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd) -> Result<IVLCmd> {
                 cmd: Cmd::seq(&body.cmd, &increment),
             };
             let loop_cmd = Cmd::_loop(invariants, variant.clone(), &[case]);
-            Ok(init.seq(&cmd_to_ivlcmd(&loop_cmd)?))
+            Ok(init.seq(&cmd_to_ivlcmd(&loop_cmd, post)?))
         }
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
     }
