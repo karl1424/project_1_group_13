@@ -10,8 +10,15 @@ use slang_ui::prelude::{
     },
     *,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct App;
+
+static FRESH: AtomicUsize = AtomicUsize::new(0);
+
+fn fresh(base: &str) -> String {
+    format!("{base}_fresh_{}", FRESH.fetch_add(1, Ordering::Relaxed))
+}
 
 #[derive(Debug, Clone)]
 struct Obligation {
@@ -273,6 +280,59 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
             let loop_cmd = Cmd::_loop(invariants, variant.clone(), &[case]);
             Ok(init.seq(&cmd_to_ivlcmd(&loop_cmd, post)?))
         }
+        CmdKind::MethodCall {
+            name,
+            fun_name: _,
+            args,
+            method,
+        } => {
+            let Some(m) = method.get() else {
+                bail!("Unresolved method call");
+            };
+
+            let mut cmds: Vec<IVLCmd> = vec![];
+            let mut subst: Vec<(String, Expr)> = vec![];
+
+            for (x, e) in m.args.iter().zip(args) {
+                let p_name = Name {
+                    span: e.span,
+                    ident: fresh(&x.name.ident),
+                };
+                cmds.push(IVLCmd::havoc(&p_name, &x.ty));
+                cmds.push(guarded(e, IVLCmd::assign(&p_name, e)));
+                subst.push((x.name.ident.clone(), Expr::ident(&p_name.ident, &x.ty)));
+            }
+
+            for f in m.requires() {
+                let pre = subst
+                    .iter()
+                    .fold(f.clone(), |e, (x, p)| e.subst_ident(x, p));
+                cmds.push(IVLCmd::assert(
+                    &pre.with_span(cmd.span),
+                    "Precondition might not hold",
+                ));
+            }
+
+            let z = match (name, &m.return_ty) {
+                (Some(z), Some(ty)) => {
+                    cmds.push(IVLCmd::havoc(z, ty));
+                    Some(Expr::ident(&z.ident, ty))
+                }
+                _ => None,
+            };
+
+            for g in m.ensures() {
+                let mut post = subst
+                    .iter()
+                    .fold(g.clone(), |e, (x, p)| e.subst_ident(x, p));
+                if let Some(z) = &z {
+                    post = post.subst_result(z);
+                }
+                cmds.push(IVLCmd::assume(&post));
+            }
+
+            Ok(IVLCmd::seqs(&cmds))
+        }
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
     }
 }
@@ -343,6 +403,14 @@ fn collect_assigned_vars(cmd: &Cmd) -> Vec<(Name, Type)> {
             .iter()
             .flat_map(|c| collect_assigned_vars(&c.cmd))
             .collect(),
+        CmdKind::MethodCall {
+            name: Some(z),
+            method,
+            ..
+        } => match method.get().and_then(|m| m.return_ty.clone()) {
+            Some(ty) => vec![(z.clone(), ty)],
+            None => vec![],
+        },
         _ => vec![],
     }
 }
