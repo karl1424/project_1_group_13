@@ -64,7 +64,7 @@ impl slang_ui::Hook for App {
 
             // get method body, convert to IVL
             let cmd = &m.body.clone().unwrap().cmd;
-            let body = cmd_to_ivlcmd(cmd, &ensures_ivl)?;
+            let body = cmd_to_ivlcmd(cmd, &ensures_ivl, &m.name.ident)?;
             let ivl = body.seq(&ensures_ivl);
 
             // put all obligations into a list of oblications with span for error localication
@@ -109,7 +109,7 @@ impl slang_ui::Hook for App {
 }
 
 /// Encode a Cmd into IVL
-fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
+fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd, method_name: &str) -> Result<IVLCmd> {
     match &cmd.kind {
         CmdKind::Assert { condition, message } => {
             Ok(guarded(condition, IVLCmd::assert(condition, message)))
@@ -117,8 +117,8 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
         CmdKind::Assume { condition } => Ok(guarded(condition, IVLCmd::assume(condition))),
         CmdKind::Assignment { name, expr } => Ok(guarded(expr, IVLCmd::assign(name, expr))),
         CmdKind::Seq(c1, c2) => Ok(IVLCmd::seq(
-            &cmd_to_ivlcmd(c1, post)?,
-            &cmd_to_ivlcmd(c2, post)?,
+            &cmd_to_ivlcmd(c1, post, method_name)?,
+            &cmd_to_ivlcmd(c2, post, method_name)?,
         )),
         CmdKind::VarDefinition { name, ty, expr, .. } => match expr {
             Some(e) => Ok(guarded(e, IVLCmd::assign(name, e))),
@@ -131,7 +131,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
                 .map(|case| {
                     Ok(IVLCmd::seq(
                         &IVLCmd::assume(&case.condition),
-                        &cmd_to_ivlcmd(&case.cmd, post)?,
+                        &cmd_to_ivlcmd(&case.cmd, post, method_name)?,
                     ))
                 })
                 .collect::<Result<_>>()?;
@@ -224,7 +224,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
                 .map(|case| {
                     Ok(IVLCmd::assume(&case.condition)
                         .seq(&variant_pre)
-                        .seq(&cmd_to_ivlcmd(&case.cmd, post)?)
+                        .seq(&cmd_to_ivlcmd(&case.cmd, post, method_name)?)
                         .seq(&variant_post))
                 })
                 .collect::<Result<_>>()?;
@@ -283,7 +283,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
                         let mut cmds = vec![];
                         for k in *a..*b {
                             cmds.push(IVLCmd::assign(name, &Expr::num(k)));
-                            cmds.push(cmd_to_ivlcmd(&body.cmd, post)?);
+                            cmds.push(cmd_to_ivlcmd(&body.cmd, post, method_name)?);
                         }
                         let last = if *a <= *b { *b } else { *a };
                         cmds.push(IVLCmd::assign(name, &Expr::num(last)));
@@ -301,22 +301,23 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
                 cmd: Cmd::seq(&body.cmd, &increment),
             };
             let loop_cmd = Cmd::_loop(invariants, variant.clone(), &[case]);
-            Ok(init.seq(&cmd_to_ivlcmd(&loop_cmd, post)?))
+            Ok(init.seq(&cmd_to_ivlcmd(&loop_cmd, post, method_name)?))
         }
         CmdKind::MethodCall {
             name,
-            fun_name: _,
+            fun_name,
             args,
             method,
         } => {
-            let Some(m) = method.get() else {
+            let Some(callee) = method.get() else {
                 bail!("Unresolved method call");
             };
 
             let mut subst: Vec<(String, Expr)> = vec![];
 
             let assign = IVLCmd::seqs(
-                &m.args
+                &callee
+                    .args
                     .iter()
                     .zip(args)
                     .map(|(x, e)| {
@@ -331,7 +332,8 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
             );
 
             let pre = IVLCmd::seqs(
-                &m.requires()
+                &callee
+                    .requires()
                     .into_iter()
                     .map(|f| {
                         let f_sub = subst
@@ -342,13 +344,46 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
                     .collect::<Vec<_>>(),
             );
 
-            let (havoc, z) = match (name, &m.return_ty) {
+            let variant_check = if let Some(m) = &callee.variant {
+                if fun_name.ident == method_name {
+                    let v_name = Name::ident(fresh("variant"));
+                    let v = Expr::ident(&v_name.ident, &Type::Int);
+
+                    let c = subst
+                        .iter()
+                        .fold(m.clone(), |e, (x, p)| e.subst_ident(x, p))
+                        .with_span(cmd.span);
+
+                    let v_assign_assert =
+                        guarded(m, IVLCmd::assign(&v_name, m)).seq(&IVLCmd::assert(
+                            &v.ge(&Expr::num(0)).with_span(cmd.span),
+                            "Loop variant might be negative",
+                        ));
+
+                    let decrease = guarded(
+                        &c,
+                        IVLCmd::assert(
+                            &c.lt(&v).with_span(cmd.span),
+                            "Loop variant might not decrease",
+                        ),
+                    );
+
+                    v_assign_assert.seq(&decrease)
+                } else {
+                    IVLCmd::nop()
+                }
+            } else {
+                IVLCmd::nop()
+            };
+
+            let (havoc, z) = match (name, &callee.return_ty) {
                 (Some(z), Some(ty)) => (IVLCmd::havoc(z, ty), Some(Expr::ident(&z.ident, ty))),
                 _ => (IVLCmd::nop(), None),
             };
 
             let post = IVLCmd::seqs(
-                &m.ensures()
+                &callee
+                    .ensures()
                     .into_iter()
                     .map(|g| {
                         let mut g_sub = subst
@@ -362,7 +397,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
                     .collect::<Vec<_>>(),
             );
 
-            Ok(assign.seq(&pre.seq(&havoc.seq(&post))))
+            Ok(assign.seq(&pre).seq(&variant_check).seq(&havoc).seq(&post))
         }
         c => bail!("not yet implemented: cmd_to_ivlcmd {c:?}"),
     }
