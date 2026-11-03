@@ -169,7 +169,7 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
         }
         CmdKind::Loop {
             invariants,
-            variant: _,
+            variant,
             body,
         } => {
             let assert_inv = IVLCmd::seqs(
@@ -196,11 +196,36 @@ fn cmd_to_ivlcmd(cmd: &Cmd, post: &IVLCmd) -> Result<IVLCmd> {
             let assume_inv =
                 IVLCmd::seqs(&invariants.iter().map(IVLCmd::assume).collect::<Vec<_>>());
 
+            let (variant_pre, variant_post) = if let Some(m) = variant {
+                let v_name = Name::ident(fresh("variant"));
+                let v = Expr::ident(&v_name.ident, &Type::Int);
+
+                let v_assign_assert = guarded(m, IVLCmd::assign(&v_name, m)).seq(&IVLCmd::assert(
+                    &v.ge(&Expr::num(0)).with_span(m.span),
+                    "Loop variant might be negative",
+                ));
+
+                let decrease = guarded(
+                    m,
+                    IVLCmd::assert(
+                        &m.lt(&v).with_span(m.span),
+                        "Loop variant might not decrease",
+                    ),
+                );
+
+                (v_assign_assert, decrease)
+            } else {
+                (IVLCmd::nop(), IVLCmd::nop())
+            };
+
             let branches: Vec<IVLCmd> = body
                 .cases
                 .iter()
                 .map(|case| {
-                    Ok(IVLCmd::assume(&case.condition).seq(&cmd_to_ivlcmd(&case.cmd, post)?))
+                    Ok(IVLCmd::assume(&case.condition)
+                        .seq(&variant_pre)
+                        .seq(&cmd_to_ivlcmd(&case.cmd, post)?)
+                        .seq(&variant_post))
                 })
                 .collect::<Result<_>>()?;
 
