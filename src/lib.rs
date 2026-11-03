@@ -36,10 +36,49 @@ impl Obligation {
     }
 }
 
+fn slang_to_smt_type<'a>(st: &'a smtlib::Storage, ty: &Type) -> Result<smtlib::sorts::Sort<'a>> {
+    match ty {
+        Type::Int => Ok(smtlib::Int::sort()),
+        Type::Bool => Ok(smtlib::Bool::sort()),
+        Type::Domain { name, .. } => Ok(smtlib::sorts::Sort::new(st, name.ident.clone())),
+        Type::Unresolved | Type::Unknown { .. } | Type::Error => {
+            bail!("Error when converting type {ty} into SMT");
+        }
+    }
+}
+
 impl slang_ui::Hook for App {
     fn analyze(&self, cx: &slang_ui::Context, file: &slang::SourceFile) -> Result<()> {
         // get reference to z3 solver
         let mut solver = cx.solver()?;
+
+        for domain in file.domains() {
+            for function in domain.functions() {
+                let args = function
+                    .args
+                    .iter()
+                    .map(|arg| slang_to_smt_type(cx.smt_st(), &arg.ty))
+                    .collect::<Result<Vec<_>>>()?;
+
+                let return_ty = slang_to_smt_type(cx.smt_st(), &function.return_ty)?;
+
+                let smt_fun = smtlib::funs::Fun::new(
+                    cx.smt_st(),
+                    function.name.ident.clone(),
+                    args,
+                    return_ty,
+                );
+
+                solver.declare_fun(&smt_fun)?;
+            }
+        }
+
+        let domain_axioms: Vec<smtlib::Bool<'_>> = file
+            .domains()
+            .iter()
+            .flat_map(|domain| domain.axioms())
+            .map(|axiom| Ok(axiom.expr.smt(cx.smt_st())?.as_bool()?))
+            .collect::<Result<_>>()?;
 
         // iterate all methods
         for m in file.methods() {
@@ -75,6 +114,10 @@ impl slang_ui::Hook for App {
 
             // open a solver scope for this method
             solver.scope(|solver| {
+                for axiom in &domain_axioms {
+                    solver.assert(axiom.clone())?;
+                }
+
                 // assert all preconditions once per method
                 for pre in pres {
                     solver.assert(pre)?;
